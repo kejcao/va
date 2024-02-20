@@ -1,13 +1,10 @@
-# import nemo.collections.asr as nemo_asr
-#
-# asr_model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained('nvidia/stt_en_conformer_ctc_small')
-# print(asr_model.transcribe(['2086-149220-0033.wav']))
-
 import copy
 import time
 import pyaudio
 import numpy as np
 import torch
+import signal
+import sys
 
 from omegaconf import OmegaConf, open_dict
 
@@ -18,67 +15,69 @@ from nemo.collections.asr.parts.utils.streaming_utils import (
 )
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 
-asr_model = nemo_asr.models.ASRModel.from_pretrained(
+# make the stt model
+stt_model = nemo_asr.models.ASRModel.from_pretrained(
     'stt_en_fastconformer_hybrid_large_streaming_80ms'
 )
-asr_model.change_decoding_strategy(decoder_type='ctc')
+stt_model.change_decoding_strategy(decoder_type='rnnt')
 
 # make sure the model's decoding strategy is optimal
-decoding_cfg = asr_model.cfg.decoding
+decoding_cfg = stt_model.cfg.decoding
 with open_dict(decoding_cfg):
     # save time by doing greedy decoding and not trying to record the alignments
     decoding_cfg.strategy = 'greedy'
     decoding_cfg.preserve_alignments = False
-    if hasattr(asr_model, 'joint'):  # if an RNNT model
+    if hasattr(stt_model, 'joint'):  # if an RNNT model
         # restrict max_symbols to make sure not stuck in infinite loop
         decoding_cfg.greedy.max_symbols = 10
         # sensible default parameter, but not necessary since batch size is 1
         decoding_cfg.fused_batch_size = -1
-    asr_model.change_decoding_strategy(decoding_cfg)
+    stt_model.change_decoding_strategy(decoding_cfg)
 
-# set model to eval mode
-asr_model.eval()
+stt_model.eval()
 
-# get parameters to use as the initial cache state
+# init STT constants
+pre_encode_cache_size = stt_model.encoder.streaming_cfg.pre_encode_cache_size[1]
+num_channels = stt_model.cfg.preprocessor.features
+
+# init variables for streaming STT
 (
     cache_last_channel,
     cache_last_time,
     cache_last_channel_len,
-) = asr_model.encoder.get_initial_cache_state(batch_size=1)
+    previous_hypotheses,
+    pred_out_stream,
+    cache_pre_encode,
+) = None, None, None, None, None, None
 
+def reset_stt():
+    global transcribed_text
+    transcribed_text = ''
 
-# init params we will use for streaming
-previous_hypotheses = None
-pred_out_stream = None
-pre_encode_cache_size = asr_model.encoder.streaming_cfg.pre_encode_cache_size[1]
-# cache-aware models require some small section of the previous processed_signal to
-# be fed in at each timestep - we initialize this to a tensor filled with zeros
-# so that we will do zero-padding for the very first chunk(s)
-num_channels = asr_model.cfg.preprocessor.features
-cache_pre_encode = torch.zeros(
-    (1, num_channels, pre_encode_cache_size), device=asr_model.device
-)
-
-
-def reset():
     global cache_last_channel, cache_last_time, cache_last_channel_len
     global previous_hypotheses, pred_out_stream
     global cache_pre_encode
 
+    # get parameters to use as the initial cache state
     (
         cache_last_channel,
         cache_last_time,
         cache_last_channel_len,
-    ) = asr_model.encoder.get_initial_cache_state(batch_size=1)
+    ) = stt_model.encoder.get_initial_cache_state(batch_size=1)
 
+    # init params we will use for streaming
     previous_hypotheses = None
     pred_out_stream = None
-    pre_encode_cache_size = asr_model.encoder.streaming_cfg.pre_encode_cache_size[1]
 
-    num_channels = asr_model.cfg.preprocessor.features
+    # cache-aware models require some small section of the previous processed_signal to
+    # be fed in at each timestep - we initialize this to a tensor filled with zeros
+    # so that we will do zero-padding for the very first chunk(s)
     cache_pre_encode = torch.zeros(
-        (1, num_channels, pre_encode_cache_size), device=asr_model.device
+        (1, num_channels, pre_encode_cache_size), device=stt_model.device
     )
+
+
+reset_stt()
 
 
 # helper function for extracting transcriptions
@@ -113,7 +112,7 @@ def init_preprocessor(asr_model):
     return preprocessor
 
 
-preprocessor = init_preprocessor(asr_model)
+preprocessor = init_preprocessor(stt_model)
 
 
 def preprocess_audio(audio, asr_model):
@@ -138,7 +137,7 @@ def transcribe_chunk(new_chunk):
     audio_data = new_chunk.astype(np.float32) / 32768
 
     # get mel-spectrogram signal & length
-    processed_signal, processed_signal_length = preprocess_audio(audio_data, asr_model)
+    processed_signal, processed_signal_length = preprocess_audio(audio_data, stt_model)
 
     # prepend with cache_pre_encode
     processed_signal = torch.cat([cache_pre_encode, processed_signal], dim=-1)
@@ -155,7 +154,7 @@ def transcribe_chunk(new_chunk):
             cache_last_time,
             cache_last_channel_len,
             previous_hypotheses,
-        ) = asr_model.conformer_stream_step(
+        ) = stt_model.conformer_stream_step(
             processed_signal=processed_signal,
             processed_signal_length=processed_signal_length,
             cache_last_channel=cache_last_channel,
@@ -173,96 +172,62 @@ def transcribe_chunk(new_chunk):
     return final_streaming_tran[0]
 
 
-# ---
-
-chunk_size = 80 + 80  # chunk size ms + encoder step length ms
-
-# open the microphone
-
-p = pyaudio.PyAudio()
-
-import requests
-import time
-import json
-import os
-import threading
-
-# def clear_row():
-#     cols, rows = os.get_terminal_size()
-#     print(' ' * cols, end='\r')
-
-prev = ('', time.time())
-llm_context = None
-state = False
-
-
-def callback(in_data, frame_count, time_info, status):
-    global llm_context
-
-    # if state:
-    #
-    text = transcribe_chunk(np.frombuffer(in_data, dtype=np.int16))
-
-    def ask(prompt):
-        global llm_context
-
-        print('BOT |', end='')
-        with requests.post(
-            'http://localhost:11434/api/generate',
-            json={
-                'model': 'phi',
-                'prompt': prompt,
-                'stream': True,
-                'context': llm_context,
-            },
-            stream=True,
-        ) as resp:
-            last_line = {}
-            for line in resp.iter_lines():
-                print((last_line := json.loads(line))['response'], flush=True, end='')
-
-        llm_context = last_line['context']
-
-    if text and text.split()[-1] == 'please':
-        state = True
-
-        prompt = ' '.join(text.split()[:-1])
-        print(f'> {prompt}')
-
-        ask(prompt)
-
-        text = ''
-        reset()
-
-        state = False
-
-    print(f'> {text}\r', end='')
-
-    return (in_data, pyaudio.paContinue)
-
-
 SAMPLE_RATE = 16000
-stream = p.open(
-    format=pyaudio.paInt16,
-    channels=1,
-    rate=SAMPLE_RATE,
-    input=True,
-    # input_device_index=6, # choose input_device_index if you have to
-    stream_callback=callback,
-    frames_per_buffer=int(SAMPLE_RATE * chunk_size / 1000) - 1,
+chunk_size = 80 + 80  # chunk size ms + encoder step length ms
+frames_per_buffer = int(SAMPLE_RATE * chunk_size / 1000) - 1
+
+# init VAD
+vad_model, utils = torch.hub.load(
+    repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=True
 )
+(get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
 
-# finally start the main loop, after all that initialization
 
-print()
-print('Listening...')
+# Provided by Alexander Veysov
+def int2float(sound):
+    abs_max = np.abs(sound).max()
+    sound = sound.astype('float32')
+    if abs_max > 0:
+        sound *= 1 / 32768
+    sound = sound.squeeze()  # depends on the use case
+    return sound
 
-stream.start_stream()
-try:
-    while stream.is_active():
-        time.sleep(0.1)
-except:
-    print()
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
+
+def start(callback_):
+    transcribed_text = ''
+    activity = []
+
+    def callback(in_data, frame_count, time_info, status):
+        audio = np.frombuffer(in_data, dtype=np.int16)
+        activity.append(
+            vad_model(torch.from_numpy(int2float(audio)), SAMPLE_RATE).item()
+        )
+
+        callback_(transcribe_chunk(audio), activity)
+        return (in_data, pyaudio.paContinue)
+
+    p = pyaudio.PyAudio()
+    stream = p.open(
+        format=pyaudio.paInt16,
+        input=True,
+        channels=1,
+        rate=SAMPLE_RATE,
+        frames_per_buffer=frames_per_buffer,
+        stream_callback=callback,
+        # input_device_index=6, # if microphone audio doesn't work, try differing this
+    )
+
+    def quit():
+        print()
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, quit)
+    stream.start_stream()
+    try:
+        while stream.is_active():
+            time.sleep(0.1)
+    except:
+        quit()
