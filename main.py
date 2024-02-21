@@ -2,58 +2,44 @@ import transcribe
 import gui
 
 import requests
+import replicate
 import time
 import json
 import threading
 
-llm_context = None
+llm_context = ''
 llm_running = False
 
 
 def prompt_llm(prompt, quiet=False):
     global llm_context, llm_running
 
-    if not quiet:
-        print('BOT | ', end='', flush=True)
+    prompt = f'[INST] {prompt} [/INST]\n'
+    llm_context += prompt
 
-    first = True
-    with requests.post(
-        'http://localhost:11434/api/generate',
-        json={
-            # 'model': 'dolphin-mistral',
-            # 'model': 'starling-lm:7b-alpha',
-            'model': 'phi:chat',
-            'prompt': prompt,
-            'stream': True,
-            'context': llm_context,
-            'system': 'You are an AI assistant. Respond as concisely as possible.',
+    print('BOT | ', end='', flush=True)
+
+    reply = ''
+    for event in replicate.stream(
+        'meta/llama-2-7b-chat',
+        input={
+            'prompt': llm_context,
+            # 'system_prompt': 'You are an AI assistant. Always respond as concisely as possible. Neglect to mention any unnecessary information not pertaining to the user input. Use as little words as possible.',
+            'system_prompt': 'You are an AI assistant. Use as little words as possible. Your responses should not exceed 30 words.',
+            'temperature': 0.1,
         },
-        stream=True,
-    ) as resp:
-        last_line = {}
-        for line in resp.iter_lines():
-            if not llm_running:  # early exit?
-                if not quiet:
-                    print()
-                return
+    ):
+        tok = str(event)
+        reply += tok
+        if tok.strip():
+            print(tok, flush=True, end='')
 
-            tok = (last_line := json.loads(line))['response']
+    print()
+    print()
 
-            if not quiet:
-                print(tok.strip() if first else tok, flush=True, end='')
-
-            first = False
-
-    if not quiet:
-        print()
-        print()
-
-    try:
-        llm_context = last_line['context']
-    except:
-        pass
-
+    llm_context += reply.strip() + '\n'
     llm_running = False
+    transcribe.reset_stt()
 
 
 def callback(transcribed_text, activity):
@@ -61,6 +47,7 @@ def callback(transcribed_text, activity):
 
     def update_gui(**kwargs):
         gui.print_user_input(f'{activity[-1]:.1f}> ', transcribed_text, **kwargs)
+
 
     if transcribed_text and len(activity) > 2 and all(x < 0.2 for x in activity[-2:]):
         if not llm_running and transcribed_text:
@@ -77,5 +64,4 @@ def callback(transcribed_text, activity):
         update_gui()
 
 
-# ask('.', quiet=True) # warm up the large language model
 transcribe.start(callback)

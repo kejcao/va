@@ -50,6 +50,7 @@ num_channels = stt_model.cfg.preprocessor.features
     cache_pre_encode,
 ) = None, None, None, None, None, None
 
+
 def reset_stt():
     global transcribed_text
     transcribed_text = ''
@@ -224,7 +225,6 @@ def start(callback_):
         p.terminate()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, quit)
     stream.start_stream()
     try:
         while stream.is_active():

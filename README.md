@@ -12,4 +12,4 @@ $ python3 main.py
 Internally, it uses:
 
 - [Nvidia](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/stt_en_fastconformer_hybrid_large_streaming_80ms)'s STT En FastConformer Hybrid Transducer-CTC Large Streaming 80ms for STT.
-- Ollama to run the LLM.
+- Replicate API to run the LLM, so make sure you have an API key environmental variable: [more details](https://replicate.com/docs/get-started/python).
