@@ -1,3 +1,4 @@
 fasttext==0.9.1
 nemo_toolkit[all]==1.21
 replicate
+llama-cpp-python
